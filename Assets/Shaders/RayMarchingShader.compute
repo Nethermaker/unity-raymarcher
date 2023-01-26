@@ -1,0 +1,224 @@
+// Each #kernel tells which function to compile; you can have many kernels
+# pragma kernel CSMain
+# include "UnityCG.cginc"
+
+// INPUTS
+RWTexture2D<float4> Result;
+Texture2D<float4> _Input;
+
+Texture2D<float4> _DepthTexture;
+SamplerState sampler_DepthTexture;
+bool _RenderWorld;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraProjection;
+float4x4 _CameraInverseProjection;
+float2 _Resolution;
+
+int _MaxMarchingSteps;
+float _MaxMarchingDistance;
+
+float3 _LightDirection;
+
+const static float EPSILON = .0001;
+
+// MATH
+
+float mod(float x, float y)
+{
+    return sign(x) * (x % y);
+}
+
+float3 mod(float3 x, float y)
+{
+    return float3(mod(x.x, y), mod(x.y, y), mod(x.z, y));
+}
+
+float smoothmin( float a, float b, float k )
+{
+    float res = exp2( -k*a ) + exp2( -k*b );
+    return -log2( res )/k;
+}
+
+// SDFs
+
+float dot2(float2 v) { return dot(v,v); }
+float dot2(float3 v) { return dot(v,v); }
+float ndot(float2 a, float2 b) { return a.x*b.x - a.y*b.y; }
+
+float sdSphere(float3 p, float3 c, float s)
+{
+    return length(p - c) - s;
+}
+
+float sdBox (float3 p, float3 c, float3 b)
+{
+    float3 q = abs(p - c) - b;
+    return length(max(q,0.0)) + min(max(q.x,max(q.y,q.z)),0.0);
+}
+
+float sdPlane(float3 p, float3 n, float h)
+{
+    return dot(p, n) + h;
+}
+
+float sdTorus(float3 p, float2 t)
+{
+    float2 q = float2(length(p.xz) - t.x, p.y);
+    return length(q) - t.y;
+}
+
+const int SPHERE = 1;
+const int BOX = 2;
+const int PLANE = 3;
+const int TORUS = 4;
+
+// SPACE FOLDING
+
+float3 repeat(float3 p, float r)
+{
+    return mod(p, r) - (r / 2);
+}
+
+float3 planeFold(float3 p, float3 n, float h)
+{
+    return 2.0 * min(0.0, dot(p.xyz, n) - h) * n;
+}
+
+// SCENE
+
+float sdScene(float3 p)
+{
+    float dist = _MaxMarchingDistance;
+    dist = min(dist, sdSphere(p, float3(0, 0.7, 0), 0.7));
+    dist = max(-dist, sdBox(p, float3(0, 1, 0), float3(2, 1, .3)));
+    dist = min(dist, sdPlane(p, float3(0, 1, 0), 0));
+    dist = min(dist, sdSphere(p, float3(1, 1, -6), 1));
+    //dist = smoothmin(dist, sdBox(p, float3(3, 1, 0), float3(1, 1, 1)), 1.5);
+    return dist;
+}
+
+// RAY MARCHING
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+    float numMarches;
+    float depth;
+    float minDepth;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.numMarches = 0;
+    ray.depth = 0;
+    ray.minDepth = _MaxMarchingDistance;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+float3 EstimateNormal(float3 p)
+{
+    return normalize(float3(
+        sdScene(float3(p.x + EPSILON, p.y, p.z)) - sdScene(float3(p.x - EPSILON, p.y, p.z)),
+        sdScene(float3(p.x, p.y + EPSILON, p.z)) - sdScene(float3(p.x, p.y - EPSILON, p.z)),
+        sdScene(float3(p.x, p.y, p.z  + EPSILON)) - sdScene(float3(p.x, p.y, p.z - EPSILON))
+    ));
+}
+
+Ray RayMarch(Ray ray)
+{
+    float depth = 0;
+    for (int i = 0; i < _MaxMarchingSteps; i++)
+    {
+        ray.numMarches = i;
+        float3 p = ray.origin + ray.direction * depth;
+        float dist = sdScene(p);
+
+        //Estimate closest distance to scene for lighting
+        ray.minDepth = min(ray.minDepth, dist);
+        
+        if (dist < EPSILON)
+        {
+            ray.depth = depth;
+            return ray;
+        }
+
+        depth += dist;
+
+        if (depth >= _MaxMarchingDistance)
+        {
+            ray.depth = _MaxMarchingDistance;
+            return ray;
+        }
+    }
+    ray.depth = _MaxMarchingDistance;
+    return ray;
+}
+
+float CalculateLighting(Ray ray)
+{
+    float3 directionalLight = normalize(_LightDirection);
+    Ray lightRay = CreateRay(ray.origin + (ray.depth - 0.1) * ray.direction, directionalLight);
+    lightRay = RayMarch(lightRay);
+
+    float light = dot(EstimateNormal(lightRay.origin), directionalLight);
+    float k = 10000;
+    if (lightRay.depth > _MaxMarchingDistance - EPSILON)
+    {
+        // Didn't hit anything, return soft shadow
+        return light * (k * lightRay.minDepth / _MaxMarchingDistance);
+    }
+    return light * 0.;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    float2 uv = float2(id.x / _Resolution.x, id.y / _Resolution.y);
+    float worldDepth = _DepthTexture.SampleLevel(sampler_DepthTexture, uv.xy, 0).r;
+    worldDepth = LinearEyeDepth(worldDepth);
+
+    // Transform pixel to screen space
+    float2 st = float2((id.xy + float2(0.5f, 0.5f)) / float2(_Resolution.x, _Resolution.y) * 2.0f - 1.0f);
+    
+    // Create a ray for the pixel
+    Ray ray = CreateCameraRay(st);
+    ray = RayMarch(ray);
+    float dist = ray.depth;
+
+    if (worldDepth < dist && _RenderWorld)
+    {
+        // Real world is in front of raymarched scene
+        Result[id.xy] = _Input[id.xy];
+        return;
+    }
+    
+    if (dist > _MaxMarchingDistance - EPSILON)
+    {
+        // Didn't hit anything, render sky
+        Result[id.xy] = float4(ray.direction * 0.5f + 0.5f, 1.0f);
+        // Result[id.xy] = _Input[id.xy];
+        return;
+    }
+
+    float light = CalculateLighting(ray);
+    Result[id.xy] = float4(light, light, light, 1);
+}
